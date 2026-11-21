@@ -164,14 +164,119 @@ function confirmBox(text, okText) {
 
 // ---------- Ma'lumotnomalar (kesh) ----------
 const REF = {};
+// Omborlar, valyutalar, narx turlari kamdan-kam o'zgaradi: telefonda saqlab, darhol ko'rsatamiz
+// va orqa fonda yangilab qo'yamiz (ekran REGOS javobini kutmaydi)
 async function ref(name) {
   if (REF[name]) return REF[name];
   const map = { stock: 'stock/get', currency: 'currency/get', pricetype: 'pricetype/get', barcodetype: 'barcodetype/get' };
   const body = name === 'barcodetype' ? {} : { limit: 500, filters: name === 'stock' ? [F('deleted_mark', false)] : [] };
-  const j = await api(map[name], body);
-  REF[name] = (j.result || []).filter(x => !x.deleted_mark && !x.deleted);
-  return REF[name];
+  const fetchIt = async () => {
+    const j = await api(map[name], body);
+    const list = (j.result || []).filter(x => !x.deleted_mark && !x.deleted);
+    REF[name] = list; LS.set('ref_' + name, list); return list;
+  };
+  const saved = LS.get('ref_' + name, null);
+  if (saved && saved.length) { REF[name] = saved; fetchIt().catch(() => {}); return saved; }
+  return fetchIt();
 }
+
+// ---------- IndexedDB (katalogni telefonda saqlash) ----------
+const IDB = {
+  db: null,
+  open() {
+    if (this.db) return this.db;
+    return this.db = new Promise((res, rej) => {
+      const r = indexedDB.open('ombor-tsd', 1);
+      r.onupgradeneeded = () => r.result.createObjectStore('kv');
+      r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+    });
+  },
+  async get(k) { try { const d = await this.open(); return await new Promise(res => { const q = d.transaction('kv').objectStore('kv').get(k); q.onsuccess = () => res(q.result); q.onerror = () => res(undefined); }); } catch (e) { return undefined; } },
+  async set(k, v) { try { const d = await this.open(); d.transaction('kv', 'readwrite').objectStore('kv').put(v, k); } catch (e) {} },
+  async clear() { try { const d = await this.open(); d.transaction('kv', 'readwrite').objectStore('kv').clear(); } catch (e) {} }
+};
+
+// Sahifalab barcha yozuvlarni olish
+async function fetchAll(method, body, size, onProgress) {
+  const out = []; let off = 0; const seen = new Set();
+  for (let p = 0; p < 300; p++) {
+    const j = await api(method, Object.assign({}, body, { limit: size, offset: off }));
+    const r = j.result || [];
+    const first = r.length ? String(r[0].id != null ? r[0].id : (r[0].item && r[0].item.id)) : '';
+    if (first && seen.has(first)) break; // server offset'ni e'tiborsiz qoldirsa — cheksiz aylanmaslik uchun
+    seen.add(first);
+    out.push(...r); if (onProgress) onProgress(out.length);
+    if (r.length < size) break;
+    off = j.next_offset || off + r.length;
+  }
+  return out;
+}
+
+// ---------- Mahalliy katalog ----------
+// Mahsulotlar va shtrix kodlar bir marta yuklanadi; skanerlashda mahsulot telefonning o'zida topiladi.
+// Har 5 daqiqada orqa fonda yangilanadi. Katalogda topilmasa — REGOS'dan so'raladi.
+const CAT = {
+  store: {},
+  key: (s, p) => (s || 0) + '_' + (p || 0),
+  slim: x => ({
+    item: { id: x.item.id, name: x.item.name, code: x.item.code, articul: x.item.articul, unit: x.item.unit ? { name: x.item.unit.name } : null, group: x.item.group ? { name: x.item.group.name } : null },
+    quantity: x.quantity ? { common: x.quantity.common, booked: x.quantity.booked, allowed: x.quantity.allowed } : null,
+    price: x.price, last_purchase_cost: x.last_purchase_cost, pricetype: x.pricetype ? { name: x.pricetype.name } : null
+  }),
+  build(c, items, codes) {
+    c.list = items; c.items = new Map(items.map(x => [x.item.id, x]));
+    c.byCode = new Map(codes.map(b => [String(b[0]), b[1]]));
+    c.byItemCode = new Map(items.map(x => [String(x.item.code), x.item.id]));
+    c.lower = items.map(x => ((x.item.name || '') + ' ' + (x.item.articul || '')).toLowerCase());
+  },
+  // Kesh tayyor bo'lsa qaytaradi; bo'lmasa yuklashni boshlab, null qaytaradi (kutmaydi)
+  peek(s, p, onProgress) { const c = this.ensure(s, p, onProgress); return c.ready ? c : null; },
+  ensure(s, p, onProgress) {
+    const k = this.key(s, p);
+    let c = this.store[k];
+    if (!c) {
+      c = this.store[k] = { ready: false, ts: 0 };
+      c.restoring = IDB.get('cat_' + k).then(saved => {
+        if (saved && !c.ready) { this.build(c, saved.items, saved.codes); c.ts = saved.ts; c.ready = true; }
+      });
+    }
+    c.restoring.then(() => {
+      if (c.loading || (c.ts && Date.now() - c.ts < 5 * 60e3)) return;
+      c.loading = this.refresh(c, k, s, p, onProgress).catch(() => {}).finally(() => { c.loading = null; });
+    });
+    if (onProgress && c.ready) onProgress(null, c);
+    return c;
+  },
+  async wait(s, p) { const c = this.ensure(s, p); await c.restoring; if (!c.ready && c.loading) await c.loading; return c.ready ? c : null; },
+  async refresh(c, k, s, p, onProgress) {
+    const f = [F('deleted_mark', false)];
+    if (s) f.push(F('stock_id', s)); if (p) f.push(F('price_type_id', p));
+    const [items, bcs] = await Promise.all([
+      fetchAll('item/getext', { filters: f }, 1000, n => onProgress && onProgress(n)),
+      fetchAll('barcode/get', {}, 1000)
+    ]);
+    const slim = items.map(this.slim), codes = bcs.map(b => [b.value, b.item_id]);
+    this.build(c, slim, codes); c.ts = Date.now(); c.ready = true;
+    if (onProgress) onProgress(null, c);
+    IDB.set('cat_' + k, { items: slim, codes, ts: c.ts });
+  },
+  find(c, term) {
+    const id = c.byCode.get(term) || c.byItemCode.get(term);
+    if (id && c.items.get(id)) return { exact: c.items.get(id) };
+    const t = term.toLowerCase(), res = [];
+    for (let i = 0; i < c.list.length && res.length < 30; i++) if (c.lower[i].includes(t)) res.push(c.list[i]);
+    return { list: res };
+  },
+  // Shtrix kod qaysi mahsulotga tegishli — tayyor keshlardan
+  owner(code) {
+    for (const k in this.store) { const c = this.store[k]; if (c.ready && c.byCode.has(code)) return { id: c.byCode.get(code), x: c.items.get(c.byCode.get(code)) }; }
+    return null;
+  },
+  anyReady() { for (const k in this.store) if (this.store[k].ready) return true; return false; },
+  addCode(code, itemId) { for (const k in this.store) { const c = this.store[k]; if (c.ready) c.byCode.set(String(code), itemId); } },
+  delCode(code) { for (const k in this.store) { const c = this.store[k]; if (c.ready) c.byCode.delete(String(code)); } },
+  reset() { this.store = {}; IDB.clear(); }
+};
 const opts = (arr, sel, label) => arr.map(x => '<option value="' + x.id + '"' + (String(x.id) === String(sel) ? ' selected' : '') + '>' + esc(label ? label(x) : x.name) + '</option>').join('');
 
 // ---------- Hujjat turlari ----------
@@ -291,7 +396,7 @@ async function findItems(term, stockId, priceTypeId, limit) {
   const filters = [F('deleted_mark', false)];
   if (stockId) filters.push(F('stock_id', stockId));
   if (priceTypeId) filters.push(F('price_type_id', priceTypeId));
-  const j = await api('item/getext', { search: term, filters, limit: limit || 30, offset: 0, image_size: 'Small' });
+  const j = await api('item/getext', { search: term, filters, limit: limit || 30, offset: 0 });
   return j.result || [];
 }
 // Shtrix kod bo'yicha aniq mos mahsulotni topish
@@ -312,16 +417,25 @@ function pickItem(list, title) {
     m.querySelector('.btn').onclick = () => { m.remove(); res(null); };
   });
 }
-// Kiritilgan matn bo'yicha mahsulotni aniqlash: avval shtrix kod, keyin umumiy qidiruv
+// Kiritilgan matn bo'yicha mahsulotni aniqlash.
+// 1) Mahalliy katalog (so'rovsiz, bir zumda). 2) Topilmasa — REGOS'ga bitta so'rov.
 async function resolveItem(term, stockId, priceTypeId) {
-  const bid = /^\S{4,}$/.test(term) ? await itemByBarcode(term) : null;
-  if (bid) {
-    const r = await api('item/getext', { filters: [F('id', bid)].concat(stockId ? [F('stock_id', stockId)] : []).concat(priceTypeId ? [F('price_type_id', priceTypeId)] : []), limit: 1 });
-    if (r.result && r.result[0]) return { item: r.result[0], byBarcode: true };
+  const c = CAT.peek(stockId, priceTypeId);
+  if (c) {
+    const r = CAT.find(c, term);
+    if (r.exact) return { item: r.exact };
+    if (r.list.length === 1) return { item: r.list[0] };
+    if (r.list.length > 1) return { item: await pickItem(r.list, '«' + term + '» bo\'yicha ' + r.list.length + ' ta natija') };
   }
+  // REGOS qidiruvi shtrix kod, kod va nom bo'yicha qidiradi — odatda bitta so'rov yetadi
   const list = await findItems(term, stockId, priceTypeId);
   if (!list.length) return { item: null, notFound: true };
   if (list.length === 1) return { item: list[0] };
+  if (/^\S{6,}$/.test(term)) {
+    const bid = await itemByBarcode(term);
+    const hit = bid && list.find(x => x.item.id === bid);
+    if (hit) return { item: hit };
+  }
   return { item: await pickItem(list, '«' + term + '» bo\'yicha ' + list.length + ' ta natija') };
 }
 
@@ -361,7 +475,7 @@ async function screenSettings() {
     try { const s = await api('stock/get', { limit: 50 }); $('#res').innerHTML = '✅ Ulandi. Omborlar: ' + esc((s.result || []).map(x => x.name).join(', ') || '—'); }
     catch (err) { $('#res').innerHTML = '❌ ' + esc(err.message); CFG = old; }
   });
-  $('#save').onclick = () => { CFG = read(); LS.set('cfg', CFG); for (const k in REF) delete REF[k]; toast('Saqlandi', 'ok'); stack.length = 0; go(screenHome, false); };
+  $('#save').onclick = () => { CFG = read(); LS.set('cfg', CFG); for (const k in REF) { delete REF[k]; } ['stock', 'currency', 'pricetype', 'barcodetype'].forEach(n => { try { localStorage.removeItem('tsd_ref_' + n); } catch (e) {} }); CAT.reset(); toast('Saqlandi', 'ok'); stack.length = 0; go(screenHome, false); };
 }
 
 // ---------- Hujjatlar ro'yxati ----------
@@ -426,10 +540,16 @@ function screenDocNew(kind) {
       const j = await api(T.doc + '/add', body);
       LS.set('last_' + kind, mem);
       const id = j.result.new_id;
-      const g = await api(T.doc + '/get', { filters: [F('id', id)], limit: 1 });
+      // Hujjatni qayta so'ramaymiz: sarlavha ma'lumotlari bizda bor
+      const byId = (arr, x) => arr.find(a => a.id === x) || { id: x, name: '' };
+      const doc = { id, date: body.date, open_date: body.open_date };
+      if (body.partner_id) doc.partner = { id: body.partner_id, name: mem.partner_name };
+      if (body.stock_id) doc.stock = byId(stocks, body.stock_id);
+      if (body.stock_sender_id) { doc.stock_sender = byId(stocks, body.stock_sender_id); doc.stock_receiver = byId(stocks, body.stock_receiver_id); }
+      if (body.price_type_id) doc.price_type = byId(pts, body.price_type_id);
       toast('Hujjat yaratildi', 'ok');
       // "Yangi hujjat" ekranini tarixga qo'shmaymiz: orqaga bosilsa ro'yxatga qaytadi
-      await go(screenDoc(kind, (g.result && g.result[0]) || { id }), false);
+      await go(screenDoc(kind, doc), false);
     });
   };
 }
@@ -459,16 +579,21 @@ function screenDoc(kind, doc) {
     let locked = false, lines = [];
     const stockId = T.stockOf(doc);
     const ptId = doc.price_type && doc.price_type.id;
-    ctx.leave = async () => { if (locked) { try { await api(T.doc + '/unlock', { ids: [doc.id] }); } catch (e) {} } };
+    // Chiqishda hujjatni bo'shatamiz, lekin javobni kutmaymiz — ekran darhol almashadi
+    ctx.leave = () => { if (locked) { locked = false; api(T.doc + '/unlock', { ids: [doc.id] }).catch(() => {}); } };
 
     $('#view').innerHTML =
       '<div class="card"><div class="kv"><b>Hujjat:</b><span>' + esc(doc.code || doc.id) + ' · ' + dstr(doc.date || doc.open_date) + '</span><b>' + (kind === 'movement' ? 'Yo\'nalish' : kind === 'inventory' ? 'Ombor' : 'Kontragent') + ':</b><span>' + esc(T.who(doc)) + '</span>' + (T.where(doc) ? '<b>Ombor:</b><span>' + esc(T.where(doc)) + '</span>' : '') + '</div><div id="lockst" class="muted" style="margin-top:6px"></div></div>' +
       '<div class="card"><div class="row" style="margin-bottom:4px"><b style="flex:1">Mahsulotlar</b><span class="muted" id="tot"></span></div><div class="list" id="lines"><div class="empty">Yuklanmoqda…</div></div></div>' +
       '<button class="btn ok" id="fin">' + T.finishText + '</button>';
 
-    // Hujjatni band qilish (lock) — REGOS qatorlarni o'zgartirishdan oldin buni talab qiladi
-    try { await api(T.doc + '/lock', { ids: [doc.id] }); locked = true; $('#lockst').textContent = '🔒 Hujjat siz uchun band qilindi'; }
-    catch (e) { $('#lockst').innerHTML = '⚠️ Band qilib bo\'lmadi: ' + esc(e.message) + '. Hujjatni faqat ko\'rish mumkin.'; $('#fin').disabled = true; }
+    let catInfo = '', lockInfo = '';
+    const status = () => { const el = $('#lockst'); if (el) el.innerHTML = lockInfo + (catInfo ? '<br>' + catInfo : ''); };
+    // Katalogni orqa fonda tayyorlaymiz (birinchi marta biroz vaqt oladi, keyin telefonda saqlanadi)
+    CAT.ensure(stockId, ptId, (n, c) => {
+      catInfo = c ? '⚡ Katalog tayyor: ' + c.list.length + ' ta mahsulot' : '⏳ Katalog yuklanmoqda: ' + n + ' ta…';
+      status();
+    });
 
     const load = async () => {
       const all = []; let off = 0;
@@ -502,10 +627,11 @@ function screenDoc(kind, doc) {
         (x.last_purchase_cost != null ? '<b>Oxirgi tannarx:</b><span>' + fmt(x.last_purchase_cost, 2) + '</span>' : '') + '</div>';
       if (existing) h += '<div class="hint">Bu mahsulot hujjatda bor: ' + fmt(qtyOf(existing)) + '. Kiritilgan son unga qo\'shiladi.</div>';
       h += '<label>' + (kind === 'inventory' ? 'Sanalgan miqdor' : 'Miqdor') + '</label><input id="lq" inputmode="decimal" value="1">';
-      if (f.includes('cost')) h += '<label>Tannarx (kirim narxi)</label><input id="lc" inputmode="decimal" value="' + (existing ? existing.cost : (x.last_purchase_cost || 0)) + '">';
+      if (f.includes('cost')) h += '<label>Tannarx (kirim narxi, 1 dona uchun)</label><div class="row"><input id="lc" inputmode="decimal" value="' + (existing ? existing.cost : (x.last_purchase_cost || 0)) + '"><button type="button" class="btn sec sm boxbtn" style="flex:0 0 auto">📦 Korobka</button></div>';
       if (f.includes('price')) h += '<label>Sotish narxi' + (kind === 'purchase' ? ' (ixtiyoriy)' : '') + '</label><input id="lp" inputmode="decimal" value="' + (existing ? (existing.price || '') : (x.price || '')) + '">';
       h += '<div class="row" style="margin-top:12px"><button class="btn sec" data-a="0">Bekor</button><button class="btn" data-a="1">Qo\'shish</button></div>';
       const m = sheet(h); const qi = m.querySelector('#lq'); qi.select(); qi.focus();
+      bindBox(m, '#lq', '#lc');
       m.querySelectorAll('input').forEach(i => i.addEventListener('keydown', e => { if (e.key === 'Enter') m.querySelector('[data-a="1"]').click(); }));
       m.querySelector('[data-a="0"]').onclick = () => { m.remove(); res(null); };
       m.querySelector('[data-a="1"]').onclick = () => {
@@ -521,22 +647,30 @@ function screenDoc(kind, doc) {
       const ex = lines.find(l => l.item_id === x.item.id || (l.item && l.item.id === x.item.id));
       const r = await lineSheet(x, ex);
       if (!r) return;
+      // Faqat bitta so'rov yuboriladi; ro'yxat butunlay qayta yuklanmaydi, ekranda o'zimiz yangilaymiz
+      const itemInfo = { id: x.item.id, name: x.item.name, code: x.item.code };
+      const newId = j => { const r = (j && j.result) || {}; return (r.ids && r.ids[0]) || r.new_id || (r.new_ids && r.new_ids[0]); };
       await busy(null, async () => {
         if (kind === 'inventory') {
-          await api(T.op + '/add', [{ document_id: doc.id, item_id: x.item.id, actual_quantity: r.q, update_actual_quantity: false }]);
+          const j = await api(T.op + '/add', [{ document_id: doc.id, item_id: x.item.id, actual_quantity: r.q, update_actual_quantity: false }]);
+          if (ex) ex.actual_quantity = (+ex.actual_quantity || 0) + r.q;
+          else { const id = newId(j); if (id) lines.unshift({ id, item_id: x.item.id, item: itemInfo, actual_quantity: r.q, registered_quantity: x.quantity ? x.quantity.common : null }); else await load(); }
         } else if (ex) {
           const row = { id: ex.id, quantity: (+ex.quantity || 0) + r.q };
           if (r.cost != null) row.cost = r.cost;
           if (r.price != null && !isNaN(r.price)) row.price = r.price;
           await api(T.op + '/edit', [row]);
+          Object.assign(ex, row);
         } else {
           const row = { document_id: doc.id, item_id: x.item.id, quantity: r.q };
           if (kind === 'purchase') { row.cost = r.cost; if (r.price != null && !isNaN(r.price)) row.price = r.price; }
           if (kind === 'wholesale' && r.price != null && !isNaN(r.price)) { row.price = r.price; row.price2 = r.price; }
-          await api(T.op + '/add', [row]);
+          const j = await api(T.op + '/add', [row]);
+          const id = newId(j);
+          if (id) lines.unshift(Object.assign({ id, item: itemInfo }, row)); else await load();
         }
+        draw();
         beep(true); toast('Qo\'shildi: ' + x.item.name, 'ok');
-        await load();
       });
     };
 
@@ -545,10 +679,11 @@ function screenDoc(kind, doc) {
       const f = T.lineFields;
       let h = '<h3>' + esc(it.name || 'Mahsulot #' + l.item_id) + '</h3>';
       h += '<label>' + (kind === 'inventory' ? 'Sanalgan miqdor' : 'Miqdor') + '</label><input id="eq" inputmode="decimal" value="' + qtyOf(l) + '">';
-      if (f.includes('cost')) h += '<label>Tannarx</label><input id="ec" inputmode="decimal" value="' + (l.cost || 0) + '">';
+      if (f.includes('cost')) h += '<label>Tannarx (1 dona uchun)</label><div class="row"><input id="ec" inputmode="decimal" value="' + (l.cost || 0) + '"><button type="button" class="btn sec sm boxbtn" style="flex:0 0 auto">📦 Korobka</button></div>';
       if (f.includes('price')) h += '<label>Narx</label><input id="ep2" inputmode="decimal" value="' + (l.price || '') + '">';
       h += '<div class="row" style="margin-top:12px"><button class="btn bad" data-a="del">O\'chirish</button><button class="btn" data-a="save">Saqlash</button></div>';
       const m = sheet(h);
+      bindBox(m, '#eq', '#ec');
       m.querySelector('[data-a="save"]').onclick = e => busy(e.currentTarget, async () => {
         const q = num(m.querySelector('#eq').value);
         if (!(q > 0) && !(kind === 'inventory' && q === 0)) throw new Error('Miqdorni to\'g\'ri kiriting');
@@ -556,12 +691,13 @@ function screenDoc(kind, doc) {
         if (kind === 'inventory') { row.actual_quantity = q; row.update_actual_quantity = true; } else row.quantity = q;
         if (m.querySelector('#ec')) row.cost = num(m.querySelector('#ec').value);
         if (m.querySelector('#ep2') && m.querySelector('#ep2').value.trim() !== '') { row.price = num(m.querySelector('#ep2').value); if (kind === 'wholesale') row.price2 = row.price; }
-        await api(T.op + '/edit', [row]); m.remove(); toast('Saqlandi', 'ok'); await load();
+        await api(T.op + '/edit', [row]); m.remove();
+        delete row.update_actual_quantity; Object.assign(l, row); draw(); toast('Saqlandi', 'ok');
       });
       m.querySelector('[data-a="del"]').onclick = async () => {
         m.remove();
         if (!await confirmBox('«' + esc(it.name || l.item_id) + '» qatorini hujjatdan o\'chirasizmi?', 'O\'chirish')) return;
-        await busy(null, async () => { await api(T.op + '/delete', [{ id: l.id }]); toast('O\'chirildi', 'ok'); await load(); });
+        await busy(null, async () => { await api(T.op + '/delete', [{ id: l.id }]); lines = lines.filter(z => z !== l); draw(); toast('O\'chirildi', 'ok'); });
       };
     };
 
@@ -595,14 +731,20 @@ function screenDoc(kind, doc) {
       if (!ok) return;
       await busy(e.currentTarget, async () => {
         await api(T.doc + '/' + T.finish, { id: doc.id });
-        try { await api(T.doc + '/unlock', { ids: [doc.id] }); } catch (er) {}
+        api(T.doc + '/unlock', { ids: [doc.id] }).catch(() => {});
         locked = false; toast(kind === 'inventory' ? 'Inventarizatsiya yopildi' : 'Hujjat o\'tkazildi', 'ok'); beep(true);
         ctx.leave = null; await back();
       });
     };
 
     setScan(onScan, 'Shtrix kodni skanerlang yoki nomini yozing…');
-    try { await load(); } catch (e) { $('#lines').innerHTML = '<div class="empty">❌ ' + esc(e.message) + '</div>'; }
+    // Band qilish va qatorlarni yuklash bir vaqtda (parallel) bajariladi
+    // (REGOS qatorlarni o'zgartirishdan oldin hujjat band qilinishini talab qiladi)
+    const [lk, ld] = await Promise.allSettled([api(T.doc + '/lock', { ids: [doc.id] }), load()]);
+    if (lk.status === 'fulfilled') { locked = true; lockInfo = '🔒 Hujjat siz uchun band qilindi'; }
+    else { lockInfo = '⚠️ Band qilib bo\'lmadi: ' + esc(lk.reason.message) + '. Hujjatni faqat ko\'rish mumkin.'; $('#fin').disabled = true; }
+    status();
+    if (ld.status === 'rejected') $('#lines').innerHTML = '<div class="empty">❌ ' + esc(ld.reason.message) + '</div>';
   };
 }
 
@@ -619,9 +761,8 @@ async function screenLookup() {
     const r = await resolveItem(term, $('#ls').value, $('#lp').value);
     if (!r.item) { $('#lres').innerHTML = '<div class="card empty">«' + esc(term) + '» topilmadi</div>'; beep(false); return; }
     beep(true);
-    const x = r.item, it = x.item, q = x.quantity || {};
-    let bcs = [];
-    try { bcs = (await api('barcode/get', { filters: [F('item_id', it.id)] })).result || []; } catch (e) {}
+    const show = (x, bcs, live) => {
+    const it = x.item, q = x.quantity || {};
     $('#lres').innerHTML = '<div class="card"><div class="big">' + esc(it.name) + '</div><div class="kv" style="margin-top:8px">' +
       '<b>Kod:</b><span>' + esc(it.code) + '</span>' + (it.articul ? '<b>Artikul:</b><span>' + esc(it.articul) + '</span>' : '') +
       (it.group ? '<b>Guruh:</b><span>' + esc(it.group.name) + '</span>' : '') +
@@ -629,10 +770,22 @@ async function screenLookup() {
       '<b>Band:</b><span>' + fmt(q.booked) + '</span><b>Mavjud:</b><span>' + fmt(q.allowed) + '</span>' +
       '<b>Narx:</b><span>' + fmt(x.price, 2) + (x.pricetype ? ' (' + esc(x.pricetype.name) + ')' : '') + '</span>' +
       '<b>Oxirgi tannarx:</b><span>' + fmt(x.last_purchase_cost, 2) + '</span>' +
-      '<b>Shtrix kodlar:</b><span>' + (bcs.map(b => esc(b.value)).join(', ') || '—') + '</span></div>' +
+      '<b>Shtrix kodlar:</b><span>' + (bcs ? (bcs.map(b => esc(b.value)).join(', ') || '—') : '…') + '</span></div>' +
+      (live ? '' : '<div class="muted" style="margin-top:4px">⏳ Qoldiq yangilanmoqda…</div>') +
       '<button class="btn sec" id="tobc" style="margin-top:10px">🏷️ Shtrix kodlarini boshqarish</button></div>';
     $('#tobc').onclick = () => go(screenBarcodes(x));
+    };
+    // Katalogdagi ma'lumot darhol ko'rsatiladi, so'ng jonli qoldiq va shtrix kodlar bir vaqtda so'raladi
+    const x0 = r.item; show(x0, null, false);
+    const s = $('#ls').value, pt = $('#lp').value;
+    const f = [F('id', x0.item.id)]; if (s) f.push(F('stock_id', s)); if (pt) f.push(F('price_type_id', pt));
+    const [fr, bc] = await Promise.allSettled([api('item/getext', { filters: f, limit: 1 }), api('barcode/get', { filters: [F('item_id', x0.item.id)] })]);
+    const x1 = (fr.status === 'fulfilled' && fr.value.result && fr.value.result[0]) || x0;
+    show(x1, bc.status === 'fulfilled' ? (bc.value.result || []) : [], true);
   }));
+  CAT.ensure($('#ls').value, $('#lp').value);
+  $('#ls').addEventListener('change', () => CAT.ensure($('#ls').value, $('#lp').value));
+  $('#lp').addEventListener('change', () => CAT.ensure($('#ls').value, $('#lp').value));
 }
 
 // =========================================================
@@ -644,6 +797,8 @@ function screenBarcodes(preItem) {
     let selected = preItem || null;
     let types = [];
     try { types = await ref('barcodetype'); } catch (e) { toast(e.message, 'bad'); }
+    CAT.ensure(0, 0); // butun katalog (ombor filtrisiz) — qidiruv va band kodlarni tekshirish uchun
+    let codes = [];
     const defType = () => { const ean = types.find(t => /ean.?13/i.test(t.name)); return LS.get('bctype', (ean || types[0] || {}).id); };
 
     const render = async () => {
@@ -677,12 +832,15 @@ function screenBarcodes(preItem) {
         if (!v) throw new Error('Shtrix kod qiymatini kiriting');
         if (v.length > 128) throw new Error('Shtrix kod 128 belgidan oshmasligi kerak');
         if (!$('#bt').value) throw new Error('Shtrix kod turini tanlang');
-        const ownerId = await itemByBarcode(v);
+        const lo = CAT.owner(v);
+        const ownerId = lo ? lo.id : await itemByBarcode(v);
         if (ownerId && ownerId !== it.id) throw new Error('Bu shtrix kod boshqa mahsulotga biriktirilgan');
         if (ownerId === it.id) throw new Error('Bu shtrix kod shu mahsulotda allaqachon bor');
-        await api('barcode/add', { item_id: it.id, barcode_type_id: +$('#bt').value, value: v, forced: false });
+        const j = await api('barcode/add', { item_id: it.id, barcode_type_id: +$('#bt').value, value: v, forced: false });
+        CAT.addCode(v, it.id);
+        const bt = types.find(t => String(t.id) === $('#bt').value);
+        if (j.result && j.result.new_id) { codes.push({ id: j.result.new_id, item_id: it.id, value: v, barcode_type: bt }); drawCodes(); } else await loadCodes();
         beep(true); toast('Shtrix kod qo\'shildi', 'ok'); $('#bv').value = ''; $('#bvinfo').textContent = '';
-        await loadCodes();
       });
       // Pastki skaner paneli bu ekranda yangi kod qiymatini to'ldiradi
       setScan(v => { $('#bv').value = v; checkValue(v); beep(true); }, 'Yangi shtrix kodni skanerlang…');
@@ -697,6 +855,10 @@ function screenBarcodes(preItem) {
       if (/^\d{13}$/.test(v)) msg = ean13ok(v) ? '✓ EAN-13 nazorat raqami to\'g\'ri' : '⚠️ EAN-13 nazorat raqami noto\'g\'ri';
       else if (/^\d{8}$/.test(v)) msg = ean8ok(v) ? '✓ EAN-8' : '⚠️ EAN-8 nazorat raqami noto\'g\'ri';
       el.textContent = msg;
+      // Avval telefondagi katalogdan darhol tekshiramiz
+      const lo = CAT.owner(v);
+      if (lo && lo.id !== selected.item.id) { el.innerHTML = '❌ Bu kod «' + esc(lo.x ? lo.x.item.name : '#' + lo.id) + '» mahsulotiga biriktirilgan'; return; }
+      if (lo) { el.textContent = 'ℹ️ Bu kod shu mahsulotda allaqachon bor'; return; }
       chkT = setTimeout(async () => {
         try {
           const owner = await itemByBarcode(v);
@@ -714,7 +876,11 @@ function screenBarcodes(preItem) {
     const loadCodes = async () => {
       try {
         const j = await api('barcode/get', { filters: [F('item_id', selected.item.id)] });
-        const list = j.result || [];
+        codes = j.result || []; drawCodes();
+      } catch (e) { $('#bcl').innerHTML = '<div class="empty">❌ ' + esc(e.message) + '</div>'; }
+    };
+    const drawCodes = () => {
+        const list = codes;
         $('#bcl').innerHTML = list.length ? list.map((b, i) =>
           '<div class="it" style="cursor:default"><div class="main"><div class="t" style="font-family:ui-monospace,monospace">' + esc(b.value) + '</div><div class="s">' + esc((b.barcode_type && b.barcode_type.name) || '') + ' ' + (b.base ? '<span class="pill base">asosiy</span>' : '') + '</div></div>' +
           '<button class="btn bad sm" data-i="' + i + '">O\'chirish</button></div>').join('')
@@ -722,12 +888,19 @@ function screenBarcodes(preItem) {
         $('#bcl').querySelectorAll('button').forEach(btn => btn.onclick = async () => {
           const b = list[+btn.dataset.i];
           if (!await confirmBox('«' + esc(b.value) + '» shtrix kodini «' + esc(selected.item.name) + '» mahsulotidan o\'chirasizmi? Bu kod bilan endi mahsulot topilmaydi.', 'O\'chirish')) return;
-          await busy(btn, async () => { await api('barcode/delete', { id: b.id }); toast('O\'chirildi', 'ok'); await loadCodes(); });
+          await busy(btn, async () => { await api('barcode/delete', { id: b.id }); CAT.delCode(b.value); codes = codes.filter(z => z !== b); drawCodes(); toast('O\'chirildi', 'ok'); });
         });
-      } catch (e) { $('#bcl').innerHTML = '<div class="empty">❌ ' + esc(e.message) + '</div>'; }
     };
 
     const onSearch = term => busy(null, async () => {
+      // Telefondagi katalogdan — so'rovsiz
+      const c = CAT.peek(0, 0);
+      if (c) {
+        const r = CAT.find(c, term);
+        if (r.exact) { selected = r.exact; beep(true); return render(); }
+        if (r.list.length === 1) { selected = r.list[0]; return render(); }
+        if (r.list.length > 1) { const p = await pickItem(r.list); if (p) { selected = p; render(); } return; }
+      }
       const owner = /^\S{4,}$/.test(term) ? await itemByBarcode(term) : null;
       if (owner) {
         const r = await api('item/getext', { filters: [F('id', owner)], limit: 1 });
@@ -763,7 +936,9 @@ function attachFlow(code, stockId, ptId) {
     const run = async () => {
       const q = m.querySelector('#aq').value.trim(); if (q.length < 2) { m.querySelector('#al').innerHTML = ''; return; }
       try {
-        list = await findItems(q, stockId, ptId, 25);
+        const c = CAT.peek(stockId, ptId) || CAT.peek(0, 0);
+        const loc = c ? CAT.find(c, q) : null;
+        list = loc && (loc.exact ? [loc.exact] : loc.list).length ? (loc.exact ? [loc.exact] : loc.list) : await findItems(q, stockId, ptId, 25);
         m.querySelector('#al').innerHTML = list.map((x, i) => '<div class="it" data-i="' + i + '"><div class="main"><div class="t">' + esc(x.item.name) + '</div><div class="s">Kod: ' + esc(x.item.code) + '</div></div></div>').join('') || '<div class="empty">Topilmadi</div>';
         m.querySelectorAll('#al .it').forEach(el => el.onclick = async () => {
           const x = list[+el.dataset.i];
@@ -771,15 +946,65 @@ function attachFlow(code, stockId, ptId) {
           try {
             await api('barcode/add', { item_id: x.item.id, barcode_type_id: +m.querySelector('#at').value, value: code, forced: false });
             LS.set('bctype', m.querySelector('#at').value);
+            CAT.addCode(code, x.item.id);
             m.remove(); beep(true); toast('Shtrix kod biriktirildi', 'ok'); res(x);
           } catch (e) { toast(e.message, 'bad'); beep(false); }
         });
       } catch (e) { m.querySelector('#al').innerHTML = '<div class="empty">❌ ' + esc(e.message) + '</div>'; }
     };
-    m.querySelector('#aq').oninput = () => { clearTimeout(t); t = setTimeout(run, 350); };
+    m.querySelector('#aq').oninput = () => { clearTimeout(t); t = setTimeout(run, CAT.anyReady() ? 120 : 350); };
     m.querySelector('#ax').onclick = () => { m.remove(); res(null); };
     m.querySelector('#aq').focus();
   });
+}
+
+// ---------- Korobka kalkulyatori ----------
+// Korobkadagi dona soni va umumiy summadan miqdor va 1 dona tannarxini hisoblaydi
+const round3 = v => Math.round(v * 1000) / 1000;
+function boxCalc() {
+  return new Promise(res => {
+    const last = LS.get('box', {});
+    const m = sheet('<h3>📦 Korobka / blok bo\'yicha hisoblash</h3>' +
+      '<label>Korobka yoki blokdagi dona soni</label><input id="bx_per" inputmode="decimal" value="' + esc(last.per || '') + '" placeholder="masalan 24">' +
+      '<label>Korobkalar soni</label><input id="bx_n" inputmode="decimal" value="1">' +
+      '<label>Umumiy summa (hamma korobkalar uchun)</label><input id="bx_sum" inputmode="decimal" placeholder="masalan 130000">' +
+      '<div id="bx_res" class="hint" style="display:none"></div>' +
+      '<div class="row" style="margin-top:12px"><button class="btn sec" data-a="0">Bekor</button><button class="btn" data-a="1">Tanlash</button></div>');
+    const g = id => num(m.querySelector(id).value);
+    const calc = () => {
+      const per = g('#bx_per'), n = g('#bx_n'), sum = g('#bx_sum');
+      if (!(per > 0) || !(n > 0) || !(sum >= 0)) return null;
+      const qty = round3(per * n);
+      return { qty, cost: round3(sum / qty), per };
+    };
+    const show = () => {
+      const r = calc(), el = m.querySelector('#bx_res');
+      if (!r) { el.style.display = 'none'; return; }
+      el.style.display = 'block';
+      el.innerHTML = 'Miqdor: <b>' + fmt(r.qty) + '</b> dona · 1 dona tannarxi: <b>' + fmt(r.cost, 3) + '</b>';
+    };
+    m.querySelectorAll('input').forEach(i => {
+      i.addEventListener('input', show);
+      i.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); m.querySelector('[data-a="1"]').click(); } });
+    });
+    m.querySelector('[data-a="0"]').onclick = () => { m.remove(); res(null); };
+    m.querySelector('[data-a="1"]').onclick = () => {
+      const r = calc();
+      if (!r) return toast('Dona soni va summani to\'g\'ri kiriting', 'bad');
+      LS.set('box', { per: r.per });
+      m.remove(); res(r);
+    };
+    const first = m.querySelector(last.per ? '#bx_sum' : '#bx_per'); first.focus();
+  });
+}
+function bindBox(m, qSel, cSel) {
+  const b = m.querySelector('.boxbtn'); if (!b) return;
+  b.onclick = async () => {
+    const r = await boxCalc(); if (!r) return;
+    m.querySelector(qSel).value = r.qty;
+    m.querySelector(cSel).value = r.cost;
+    m.querySelector(cSel).dispatchEvent(new Event('input'));
+  };
 }
 
 function ean13ok(v) { let s = 0; for (let i = 0; i < 12; i++) s += (+v[i]) * (i % 2 ? 3 : 1); return (10 - s % 10) % 10 === +v[12]; }
