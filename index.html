@@ -965,9 +965,9 @@ function boxCalc() {
   return new Promise(res => {
     const last = LS.get('box', {});
     const m = sheet('<h3>📦 Korobka / blok bo\'yicha hisoblash</h3>' +
-      '<label>Korobka yoki blokdagi dona soni</label><input id="bx_per" inputmode="decimal" value="' + esc(last.per || '') + '" placeholder="masalan 24">' +
       '<label>Korobkalar soni</label><input id="bx_n" inputmode="decimal" value="1">' +
-      '<label>Umumiy summa (hamma korobkalar uchun)</label><input id="bx_sum" inputmode="decimal" placeholder="masalan 130000">' +
+      '<label>Korobka yoki blokdagi dona soni</label><input id="bx_per" inputmode="decimal" value="' + esc(last.per || '') + '">' +
+      '<label>Umumiy summa (hamma korobkalar uchun)</label><input id="bx_sum" inputmode="decimal">' +
       '<div id="bx_res" class="hint" style="display:none"></div>' +
       '<div class="row" style="margin-top:12px"><button class="btn sec" data-a="0">Bekor</button><button class="btn" data-a="1">Tanlash</button></div>');
     const g = id => num(m.querySelector(id).value);
