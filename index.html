@@ -842,8 +842,10 @@ function screenBarcodes(preItem) {
         if (j.result && j.result.new_id) { codes.push({ id: j.result.new_id, item_id: it.id, value: v, barcode_type: bt }); drawCodes(); } else await loadCodes();
         beep(true); toast('Shtrix kod qo\'shildi', 'ok'); $('#bv').value = ''; $('#bvinfo').textContent = '';
       });
-      // Pastki skaner paneli bu ekranda yangi kod qiymatini to'ldiradi
-      setScan(v => { $('#bv').value = v; checkValue(v); beep(true); }, 'Yangi shtrix kodni skanerlang…');
+      // Pastki panel — boshqa mahsulotni topish va unga o'tish.
+      // Yangi shtrix kod esa o'rtadagi "Shtrix kod qiymati" maydoniga kiritiladi (fokus o'sha yerda turadi).
+      setScan(onSearch, 'Boshqa mahsulot: shtrix kod yoki nomi…');
+      setTimeout(() => { if (!document.querySelector('.modal') && $('#bv')) $('#bv').focus({ preventScroll: true }); }, 120);
       await loadCodes();
     };
 
@@ -963,10 +965,9 @@ function attachFlow(code, stockId, ptId) {
 const round3 = v => Math.round(v * 1000) / 1000;
 function boxCalc() {
   return new Promise(res => {
-    const last = LS.get('box', {});
     const m = sheet('<h3>📦 Korobka / blok bo\'yicha hisoblash</h3>' +
       '<label>Korobkalar soni</label><input id="bx_n" inputmode="decimal" value="1">' +
-      '<label>Korobka yoki blokdagi dona soni</label><input id="bx_per" inputmode="decimal" value="' + esc(last.per || '') + '">' +
+      '<label>Korobka yoki blokdagi dona soni</label><input id="bx_per" inputmode="decimal">' +
       '<label>Umumiy summa (hamma korobkalar uchun)</label><input id="bx_sum" inputmode="decimal">' +
       '<div id="bx_res" class="hint" style="display:none"></div>' +
       '<div class="row" style="margin-top:12px"><button class="btn sec" data-a="0">Bekor</button><button class="btn" data-a="1">Tanlash</button></div>');
@@ -991,10 +992,9 @@ function boxCalc() {
     m.querySelector('[data-a="1"]').onclick = () => {
       const r = calc();
       if (!r) return toast('Dona soni va summani to\'g\'ri kiriting', 'bad');
-      LS.set('box', { per: r.per });
       m.remove(); res(r);
     };
-    const first = m.querySelector(last.per ? '#bx_sum' : '#bx_per'); first.focus();
+    m.querySelector('#bx_per').focus();
   });
 }
 function bindBox(m, qSel, cSel) {
