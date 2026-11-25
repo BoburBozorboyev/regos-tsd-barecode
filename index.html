@@ -408,6 +408,33 @@ async function itemByBarcode(code) {
   } catch (e) { if (e.code == null) throw e; }
   return null;
 }
+// ---------- Markirovka (Asl belgisi, DataMatrix) ----------
+// Markirovka kodidan mahsulotning GTIN (shtrix kodi)ni ajratib oladi.
+// Format: 01 + 14 raqam GTIN + 21 + seriya raqami + ... (yoki sigaret qutisidagi qisqa kod: 14 raqam + seriya)
+function parseMarking(raw) {
+  const s = String(raw || '').trim().replace(/^\](d2|C1|Q3|e0)/, '').replace(/[\x1D\x1E\x04\s()]/g, '');
+  let gtin = null;
+  const m = s.match(/^01(\d{14})21/) || (s.length >= 18 ? s.match(/^01(\d{14})/) : null);
+  if (m) gtin = m[1];
+  else if (/^\d{14}/.test(s) && s.length >= 21 && /\D/.test(s.slice(14))) gtin = s.slice(0, 14);
+  if (!gtin) return null;
+  const ean = gtin.replace(/^0/, '');                 // 14 raqam → EAN-13
+  const cands = [...new Set([ean, gtin, gtin.replace(/^0+/, '')])];
+  return { gtin, ean, cands };
+}
+// Markirovka bo'yicha mahsulotni topish: avval telefondagi katalog, so'ng REGOS
+async function markingItem(mk, stockId, priceTypeId) {
+  const c = CAT.peek(stockId, priceTypeId);
+  if (c) for (const k of mk.cands) { const id = c.byCode.get(k) || c.byItemCode.get(k); if (id && c.items.get(id)) return c.items.get(id); }
+  for (const k of mk.cands) {
+    const id = await itemByBarcode(k);
+    if (!id) continue;
+    const f = [F('id', id)]; if (stockId) f.push(F('stock_id', stockId)); if (priceTypeId) f.push(F('price_type_id', priceTypeId));
+    const j = await api('item/getext', { filters: f, limit: 1 });
+    if (j.result && j.result[0]) return j.result[0];
+  }
+  return null;
+}
 function pickItem(list, title) {
   return new Promise(res => {
     const m = sheet('<h3>' + esc(title || 'Mahsulotni tanlang') + '</h3><div class="list">' + list.map((x, i) =>
@@ -420,6 +447,12 @@ function pickItem(list, title) {
 // Kiritilgan matn bo'yicha mahsulotni aniqlash.
 // 1) Mahalliy katalog (so'rovsiz, bir zumda). 2) Topilmasa — REGOS'ga bitta so'rov.
 async function resolveItem(term, stockId, priceTypeId) {
+  // 0) Markirovka (DataMatrix) bo'lsa — undagi shtrix kod bo'yicha qidiramiz
+  const mk = parseMarking(term);
+  if (mk) {
+    const x = await markingItem(mk, stockId, priceTypeId);
+    return x ? { item: x, marking: mk } : { item: null, notFound: true, marking: mk };
+  }
   const c = CAT.peek(stockId, priceTypeId);
   if (c) {
     const r = CAT.find(c, term);
@@ -708,15 +741,19 @@ function screenDoc(kind, doc) {
         if (r.item) return addItem(r.item);
         if (r.notFound) {
           beep(false);
-          const isCode = /^\d{6,14}$/.test(term) || /^\S{6,}$/.test(term);
-          const m = sheet('<h3>Topilmadi</h3><p>«' + esc(term) + '» bo\'yicha mahsulot topilmadi.</p>' +
+          const mk = r.marking;
+          const code = mk ? mk.ean : term; // markirovkaning o'zini emas, undagi shtrix kodni biriktiramiz
+          const isCode = !!mk || /^\S{6,}$/.test(term);
+          const m = sheet('<h3>Topilmadi</h3>' + (mk
+            ? '<p>Markirovka o\'qildi, lekin mahsulot topilmadi.</p><div class="kv"><b>Shtrix kod:</b><span style="font-family:ui-monospace,monospace">' + esc(mk.ean) + '</span></div>'
+            : '<p>«' + esc(term) + '» bo\'yicha mahsulot topilmadi.</p>') +
             (isCode ? '<p class="muted">Bu yangi shtrix kod bo\'lsa, uni mavjud mahsulotga biriktirishingiz mumkin.</p><button class="btn" data-a="1">🏷️ Shtrix kodni mahsulotga biriktirish</button>' : '') +
             '<button class="btn sec" data-a="0" style="margin-top:8px">Yopish</button>');
           m.querySelector('[data-a="0"]').onclick = () => m.remove();
           const b1 = m.querySelector('[data-a="1"]');
           if (b1) b1.onclick = async () => {
             m.remove();
-            const att = await attachFlow(term, stockId, ptId);
+            const att = await attachFlow(code, stockId, ptId);
             if (att) addItem(att);
           };
         }
@@ -737,7 +774,7 @@ function screenDoc(kind, doc) {
       });
     };
 
-    setScan(onScan, 'Shtrix kodni skanerlang yoki nomini yozing…');
+    setScan(onScan, 'Shtrix kod, markirovka yoki nom…');
     // Band qilish va qatorlarni yuklash bir vaqtda (parallel) bajariladi
     // (REGOS qatorlarni o'zgartirishdan oldin hujjat band qilinishini talab qiladi)
     const [lk, ld] = await Promise.allSettled([api(T.doc + '/lock', { ids: [doc.id] }), load()]);
@@ -759,7 +796,7 @@ async function screenLookup() {
   $('#ls').onchange = save; $('#lp').onchange = save;
   setScan(term => busy(null, async () => {
     const r = await resolveItem(term, $('#ls').value, $('#lp').value);
-    if (!r.item) { $('#lres').innerHTML = '<div class="card empty">«' + esc(term) + '» topilmadi</div>'; beep(false); return; }
+    if (!r.item) { $('#lres').innerHTML = '<div class="card empty">«' + esc(r.marking ? r.marking.ean : term) + '» topilmadi' + (r.marking ? ' (markirovkadan olingan shtrix kod)' : '') + '</div>'; beep(false); return; }
     beep(true);
     const show = (x, bcs, live) => {
     const it = x.item, q = x.quantity || {};
@@ -895,6 +932,15 @@ function screenBarcodes(preItem) {
     };
 
     const onSearch = term => busy(null, async () => {
+      // Markirovka skanerlansa — undagi shtrix kod bo'yicha
+      const mk = parseMarking(term);
+      if (mk) {
+        const x = await markingItem(mk, 0, 0);
+        if (x) { selected = x; beep(true); return render(); }
+        const att = await attachFlow(mk.ean);
+        if (att) { selected = att; render(); }
+        return;
+      }
       // Telefondagi katalogdan — so'rovsiz
       const c = CAT.peek(0, 0);
       if (c) {

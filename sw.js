@@ -1,5 +1,5 @@
 // Ombor TSD — ilova qobig'ini keshlaydi (REGOS so'rovlari keshlanmaydi)
-const CACHE = 'ombor-tsd-v5';
+const CACHE = 'ombor-tsd-v6';
 const SHELL = ['./', 'index.html', 'manifest.webmanifest', 'icon.svg'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL))); self.skipWaiting(); });
 self.addEventListener('activate', e => {
