@@ -417,15 +417,20 @@ const costOf = x => {
   for (const k of ['last_purchase_cost', 'cost', 'average_cost', 'purchase_cost']) { const v = +x[k]; if (x[k] != null && v > 0) return v; }
   return null;
 };
+// Mahsulot harakati tarixidan (itemoperation/get) oxirgi kirimdagi tannarxni olamiz.
+// (purchaseoperation/get bitta hujjat raqamisiz ishlamaydi, shuning uchun u yaramaydi.)
 const COSTS = new Map();
+let costErr = ''; // tannarx olinmagan bo'lsa — sababi (ekranda ko'rsatish uchun)
 async function lastCost(itemId) {
   if (COSTS.has(itemId)) return COSTS.get(itemId);
   let v = null;
   try {
-    const j = await api('purchaseoperation/get', { filters: [F('item_id', itemId)], limit: 1, offset: 0, sort_orders: [{ column: 'id', direction: 'DESC' }] });
-    const r = (j.result || [])[0];
-    if (r && +r.cost > 0) v = +r.cost;
-  } catch (e) {}
+    const j = await api('itemoperation/get', { filters: [F('item_id', itemId)], limit: 50, offset: 0, sort_orders: [{ column: 'date', direction: 'DESC' }] });
+    const rows = j.result || [];
+    const hit = rows.find(r => r.positive !== false && +r.cost > 0) || rows.find(r => +r.cost > 0);
+    if (hit) v = +hit.cost;
+    else costErr = rows.length ? 'REGOS harakatlarda tannarxni bermadi (integratsiyada «tannarxni ko\'rish» ruxsati yo\'q bo\'lishi mumkin)' : 'Bu mahsulot bo\'yicha kirim topilmadi';
+  } catch (e) { costErr = e.message; }
   COSTS.set(itemId, v); return v;
 }
 
@@ -834,7 +839,7 @@ async function screenLookup() {
       '<b>Qoldiq:</b><span>' + fmt(q.common) + (it.unit ? ' ' + esc(it.unit.name) : '') + '</span>' +
       '<b>Band:</b><span>' + fmt(q.booked) + '</span><b>Mavjud:</b><span>' + fmt(q.allowed) + '</span>' +
       '<b>Narx:</b><span>' + fmt(x.price, 2) + (x.pricetype ? ' (' + esc(x.pricetype.name) + ')' : '') + '</span>' +
-      '<b>Oxirgi tannarx:</b><span>' + (cost != null ? fmt(cost, 2) + (costOf(x) == null ? ' <span class="muted">(oxirgi kirimdan)</span>' : '') : (live ? '—' : '…')) + '</span>' +
+      '<b>Oxirgi tannarx:</b><span>' + (cost != null ? fmt(cost, 2) + (costOf(x) == null ? ' <span class="muted">(oxirgi kirimdan)</span>' : '') : (live ? '— <span class="muted">(' + esc(costErr || 'REGOS bermadi') + ')</span>' : '…')) + '</span>' +
       '<b>Shtrix kodlar:</b><span>' + (bcs ? (bcs.map(b => esc(b.value)).join(', ') || '—') : '…') + '</span></div>' +
       (live ? '' : '<div class="muted" style="margin-top:4px">⏳ Qoldiq yangilanmoqda…</div>') +
       '<button class="btn sec" id="tobc" style="margin-top:10px">🏷️ Shtrix kodlarini boshqarish</button></div>';
