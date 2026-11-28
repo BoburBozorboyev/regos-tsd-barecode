@@ -509,11 +509,12 @@ async function screenHome() {
   $('#view').innerHTML = '<div class="tiles">' +
     Object.entries(DOCS).map(([k, d]) => '<div class="tile" data-k="' + k + '"><span class="ic">' + d.icon + '</span>' + d.title + '</div>').join('') +
     '<div class="tile wide" data-k="barcode"><span class="ic">🏷️</span>Shtrix kodlar<div class="muted" style="font-weight:400">Mahsulotga shtrix kod qo\'shish, yaratish, o\'chirish</div></div>' +
+    '<div class="tile wide" data-k="newitem" style="background:#fff"><span class="ic">➕</span>Yangi mahsulot<div class="muted" style="font-weight:400">Nomenklatura yaratish: nom, guruh, shtrix kod, narx</div></div>' +
     '<div class="tile wide" data-k="lookup" style="background:#fff"><span class="ic">🔎</span>Mahsulot ma\'lumoti<div class="muted" style="font-weight:400">Narx va qoldiqni ko\'rish</div></div>' +
     '</div>';
   $('#view').querySelectorAll('.tile').forEach(t => t.onclick = () => {
     const k = t.dataset.k;
-    if (k === 'barcode') go(screenBarcodes()); else if (k === 'lookup') go(screenLookup); else go(screenDocList(k));
+    if (k === 'newitem') newItemSheet(); else if (k === 'barcode') go(screenBarcodes()); else if (k === 'lookup') go(screenLookup); else go(screenDocList(k));
   });
 }
 
@@ -534,7 +535,7 @@ async function screenSettings() {
     try { const s = await api('stock/get', { limit: 50 }); $('#res').innerHTML = '✅ Ulandi. Omborlar: ' + esc((s.result || []).map(x => x.name).join(', ') || '—'); }
     catch (err) { $('#res').innerHTML = '❌ ' + esc(err.message); CFG = old; }
   });
-  $('#save').onclick = () => { CFG = read(); LS.set('cfg', CFG); for (const k in REF) { delete REF[k]; } ['stock', 'currency', 'pricetype', 'barcodetype'].forEach(n => { try { localStorage.removeItem('tsd_ref_' + n); } catch (e) {} }); CAT.reset(); toast('Saqlandi', 'ok'); stack.length = 0; go(screenHome, false); };
+  $('#save').onclick = () => { CFG = read(); LS.set('cfg', CFG); for (const k in REF) { delete REF[k]; } ['stock', 'currency', 'pricetype', 'barcodetype', 'itemgroup', 'unit'].forEach(n => { try { localStorage.removeItem('tsd_ref_' + n); } catch (e) {} }); try { localStorage.removeItem('tsd_novat'); } catch (e) {} CAT.reset(); toast('Saqlandi', 'ok'); stack.length = 0; go(screenHome, false); };
 }
 
 // ---------- Hujjatlar ro'yxati ----------
@@ -779,9 +780,15 @@ function screenDoc(kind, doc) {
           const m = sheet('<h3>Topilmadi</h3>' + (mk
             ? '<p>Markirovka o\'qildi, lekin mahsulot topilmadi.</p><div class="kv"><b>Shtrix kod:</b><span style="font-family:ui-monospace,monospace">' + esc(mk.ean) + '</span></div>'
             : '<p>«' + esc(term) + '» bo\'yicha mahsulot topilmadi.</p>') +
-            (isCode ? '<p class="muted">Bu yangi shtrix kod bo\'lsa, uni mavjud mahsulotga biriktirishingiz mumkin.</p><button class="btn" data-a="1">🏷️ Shtrix kodni mahsulotga biriktirish</button>' : '') +
+            (isCode ? '<p class="muted">Bu yangi shtrix kod bo\'lsa, uni mavjud mahsulotga biriktirishingiz yoki yangi mahsulot yaratishingiz mumkin.</p><button class="btn" data-a="1">🏷️ Shtrix kodni mahsulotga biriktirish</button>' : '') +
+            '<button class="btn sec" data-a="2" style="margin-top:8px">➕ Yangi mahsulot yaratish</button>' +
             '<button class="btn sec" data-a="0" style="margin-top:8px">Yopish</button>');
           m.querySelector('[data-a="0"]').onclick = () => m.remove();
+          m.querySelector('[data-a="2"]').onclick = async () => {
+            m.remove();
+            const x = await newItemSheet(isCode ? { barcode: code } : { name: term });
+            if (x) addItem(x);
+          };
           const b1 = m.querySelector('[data-a="1"]');
           if (b1) b1.onclick = async () => {
             m.remove();
@@ -1036,6 +1043,129 @@ function attachFlow(code, stockId, ptId) {
     m.querySelector('#aq').oninput = () => { clearTimeout(t); t = setTimeout(run, CAT.anyReady() ? 120 : 350); };
     m.querySelector('#ax').onclick = () => { m.remove(); res(null); };
     m.querySelector('#aq').focus();
+  });
+}
+
+// =========================================================
+// YANGI MAHSULOT (nomenklatura) YARATISH
+// =========================================================
+// Guruhlar va o'lchov birliklari ro'yxati (telefonda saqlanadi)
+async function refList(key, method) {
+  if (REF[key]) return REF[key];
+  const fetchIt = async () => {
+    const j = await api(method, { limit: 1000, offset: 0 });
+    const list = (j.result || []).filter(x => !x.deleted_mark && !x.deleted);
+    REF[key] = list; LS.set('ref_' + key, list); return list;
+  };
+  const saved = LS.get('ref_' + key, null);
+  if (saved && saved.length) { REF[key] = saved; fetchIt().catch(() => {}); return saved; }
+  return fetchIt();
+}
+// Guruhning to'liq yo'li: «Ichimliklar / Suv»
+function groupPaths(groups) {
+  const by = new Map(groups.map(g => [g.id, g]));
+  const path = g => { const out = []; let c = g, n = 0; while (c && n++ < 10) { out.unshift(c.name); c = c.parent_id ? by.get(c.parent_id) : null; } return out.join(' / '); };
+  return groups.map(g => ({ id: g.id, name: path(g) })).sort((a, b) => a.name.localeCompare(b.name));
+}
+// «QQSsiz» (Без НДС) stavkasini topish
+async function noVatId() {
+  const saved = LS.get('novat', null); if (saved) return saved;
+  const isNo = v => v && (+v.value === 0 || /без|siz|without|no vat/i.test(v.name || ''));
+  let vats = [];
+  try { const j = await api('vat/get', {}); vats = j.result || []; } catch (e) {}
+  if (!vats.length) { // zaxira: mavjud mahsulotlardan QQS turlarini yig'amiz
+    try { const j = await api('item/getext', { filters: [F('deleted_mark', false)], limit: 200, offset: 0 }); vats = (j.result || []).map(x => x.item && x.item.vat).filter(Boolean); } catch (e) {}
+  }
+  const v = vats.find(isNo);
+  if (!v) throw new Error('REGOS\'da «QQSsiz» stavkasi topilmadi');
+  LS.set('novat', v.id); return v.id;
+}
+// Sotish narxini o'rnatish: narx o'rnatish hujjati → qator → o'tkazish
+async function setSalePrice(itemId, priceTypeId, value) {
+  const d = await api('docsetprice/add', { price_type_id: +priceTypeId, description: 'MarketPro: yangi mahsulot narxi' });
+  const id = d.result.new_id;
+  await api('docsetprice/lock', { ids: [id] });
+  try {
+    await api('setpriceoperation/add', [{ document_id: id, item_id: itemId, new_value: value }]);
+    await api('docsetprice/perform', { id });
+  } finally { api('docsetprice/unlock', { ids: [id] }).catch(() => {}); }
+}
+
+// Forma. prefill: { barcode } — skanerlangan, topilmagan kod. Natija: yaratilgan mahsulot (item/getext ko'rinishida) yoki null
+function newItemSheet(prefill) {
+  return new Promise(async res => {
+    let groups, units, pts, types;
+    try {
+      [groups, units, pts, types] = await Promise.all([refList('itemgroup', 'itemgroup/get'), refList('unit', 'unit/get'), ref('pricetype'), ref('barcodetype')]);
+    } catch (e) { toast(e.message, 'bad'); return res(null); }
+    const N = LS.get('newitem', {});
+    const gp = groupPaths(groups);
+    const defUnit = N.unit || (units.find(u => /^(dona|шт|pcs)/i.test(u.name)) || units[0] || {}).id;
+    const pre = prefill && prefill.barcode ? prefill.barcode : '';
+    const m = sheet('<h3>➕ Yangi mahsulot</h3>' +
+      '<label>Nomi</label><input id="ni_name" maxlength="250" autocomplete="off" placeholder="Masalan: Coca-Cola 1,5 l" value="' + esc(prefill && prefill.name ? prefill.name : '') + '">' +
+      '<label>Guruh</label><select id="ni_grp">' + opts(gp, N.group) + '</select>' +
+      '<label>O\'lchov birligi</label><select id="ni_unit">' + opts(units, defUnit) + '</select>' +
+      '<label>QQS</label><input value="QQSsiz (avtomatik)" readonly style="background:#f3f5f8">' +
+      '<label>Shtrix kod</label><div class="row"><input id="ni_bc" inputmode="numeric" autocomplete="off" placeholder="Skanerlang yoki yozing" value="' + esc(pre) + '"><button type="button" class="cam" id="ni_cam" aria-label="Kamera">📷</button></div>' +
+      '<div class="row" style="margin-top:6px"><button type="button" class="btn sec sm" id="ni_gen" style="flex:0 0 auto">EAN-13 yaratish</button><span id="ni_bcinfo" class="muted"></span></div>' +
+      '<label>Sotish narxi (ixtiyoriy)</label><div class="row"><input id="ni_price" inputmode="decimal" placeholder="Bo\'sh qoldirsa — narxsiz"><select id="ni_pt" style="flex:0 0 42%">' + opts(pts, N.pt) + '</select></div>' +
+      '<div class="row" style="margin-top:14px"><button class="btn sec" data-a="0">Bekor</button><button class="btn" data-a="1">Yaratish</button></div>');
+    const $m = s => m.querySelector(s);
+    setTimeout(() => $m('#ni_name').focus(), 50);
+    const bcCheck = async () => {
+      let v = $m('#ni_bc').value.trim(); const el = $m('#ni_bcinfo'); el.textContent = '';
+      const mk = parseMarking(v); if (mk) { v = mk.ean; $m('#ni_bc').value = v; el.textContent = 'Markirovkadan olindi'; }
+      if (!v) return;
+      const lo = CAT.owner(v); const owner = lo ? lo.id : await itemByBarcode(v).catch(() => null);
+      if (owner) el.innerHTML = '❌ Bu kod boshqa mahsulotda bor';
+      else if (/^\d{13}$/.test(v)) el.textContent = ean13ok(v) ? '✓ EAN-13' : '⚠️ EAN-13 nazorat raqami noto\'g\'ri';
+    };
+    $m('#ni_bc').addEventListener('change', bcCheck);
+    $m('#ni_bc').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); bcCheck(); $m('#ni_price').focus(); } });
+    $m('#ni_cam').onclick = async () => { const v = await cameraScan(); if (v) { $m('#ni_bc').value = v; bcCheck(); } };
+    $m('#ni_gen').onclick = e => busy(e.currentTarget, async () => { const j = await api('barcode/generateean13', {}); $m('#ni_bc').value = String(j.result.value); bcCheck(); });
+    if (pre) bcCheck();
+    $m('[data-a="0"]').onclick = () => { m.remove(); res(null); };
+    $m('[data-a="1"]').onclick = e => busy(e.currentTarget, async () => {
+      const name = $m('#ni_name').value.trim().replace(/\s+/g, ' ');
+      if (!name) throw new Error('Mahsulot nomini kiriting');
+      if (!$m('#ni_grp').value) throw new Error('Guruhni tanlang');
+      if (!$m('#ni_unit').value) throw new Error('O\'lchov birligini tanlang');
+      let bc = $m('#ni_bc').value.trim(); const mk = parseMarking(bc); if (mk) bc = mk.ean;
+      const priceStr = $m('#ni_price').value.trim(); const price = priceStr === '' ? null : num(priceStr);
+      if (price != null && !(price >= 0)) throw new Error('Narxni to\'g\'ri kiriting');
+      if (bc) { const lo = CAT.owner(bc); if (lo || await itemByBarcode(bc)) throw new Error('Bu shtrix kod boshqa mahsulotga biriktirilgan'); }
+      // Shu nomli mahsulot bormi — ogohlantiramiz
+      const same = (await findItems(name, null, null, 5)).find(x => (x.item.name || '').trim().toLowerCase() === name.toLowerCase());
+      if (same && !await confirmBox('«' + esc(name) + '» nomli mahsulot allaqachon bor (kod: ' + esc(same.item.code) + '). Baribir yangisini yaratasizmi?', 'Yaratish')) return;
+
+      const vat_id = await noVatId();
+      const add = await api('item/add', { type: 'Item', name, group_id: +$m('#ni_grp').value, unit_id: +$m('#ni_unit').value, vat_id });
+      const itemId = add.result.new_id;
+      LS.set('newitem', { group: $m('#ni_grp').value, unit: $m('#ni_unit').value, pt: $m('#ni_pt').value });
+      const warn = [];
+      if (bc) {
+        try {
+          const ean = types.find(t => /ean.?13/i.test(t.name));
+          const tid = /^\d{13}$/.test(bc) && ean ? ean.id : LS.get('bctype', (ean || types[0] || {}).id);
+          await api('barcode/add', { item_id: itemId, barcode_type_id: +tid, value: bc, forced: false });
+          CAT.addCode(bc, itemId);
+        } catch (err) { warn.push('shtrix kod qo\'shilmadi: ' + err.message); }
+      }
+      if (price != null && price > 0) {
+        try { await setSalePrice(itemId, $m('#ni_pt').value, price); }
+        catch (err) { warn.push('narx o\'rnatilmadi: ' + err.message); }
+      }
+      // Katalog keyingi safar yangilansin
+      for (const k in CAT.store) CAT.store[k].ts = 0;
+      let x = null;
+      try { const j = await api('item/getext', { filters: [F('id', itemId)], limit: 1 }); x = j.result && j.result[0]; } catch (err) {}
+      if (!x) x = { item: { id: itemId, name, code: '' }, quantity: null, price };
+      m.remove(); beep(true);
+      toast(warn.length ? 'Mahsulot yaratildi, lekin ' + warn.join('; ') : 'Yaratildi: ' + name + (x.item.code ? ' (kod ' + x.item.code + ')' : ''), warn.length ? 'bad' : 'ok');
+      res(x);
+    });
   });
 }
 
